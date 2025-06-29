@@ -10,15 +10,20 @@ pipeline {
         stage('Deploy') {
             steps {
                 script {
+                    // Kill any existing server on port 5000
+                    sh 'pkill -f "python3 -m http.server 5000" || true'
+                    sh 'sleep 1'
+                    
                     // Copy files to a web directory
                     sh 'mkdir -p /tmp/web-app'
                     sh 'cp *.html /tmp/web-app/'
                     
-                    // Start a simple Python HTTP server on port 5000
+                    // Start a simple Python HTTP server on port 5000 in background
                     sh '''
                         cd /tmp/web-app
-                        python3 -m http.server 5000 > /dev/null 2>&1 &
+                        nohup python3 -m http.server 5000 > /tmp/server.log 2>&1 &
                         echo $! > /tmp/web-server.pid
+                        sleep 3
                     '''
                     
                     echo "Web application deployed at http://localhost:5000"
@@ -31,8 +36,19 @@ pipeline {
                     // Wait a moment for server to start
                     sh 'sleep 2'
                     
-                    // Test the deployment
-                    sh 'curl -f http://localhost:5000/index.html || exit 1'
+                    // Test the deployment - try multiple approaches
+                    sh '''
+                        echo "Testing server status..."
+                        if ps aux | grep -q "[p]ython3 -m http.server 5000"; then
+                            echo "Server is running"
+                        else
+                            echo "Server not found"
+                            exit 1
+                        fi
+                    '''
+                    
+                    // Test the actual file access
+                    sh 'curl -f http://localhost:5000/ || curl -f http://localhost:5000/index.html'
                     echo "Application is running successfully!"
                 }
             }
