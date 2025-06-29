@@ -81,7 +81,7 @@ pipeline {
                         # Verify server started correctly
                         if [ -f /tmp/server.log ]; then
                             echo "Server log exists, checking for errors..."
-                            if grep -q "Error\|Traceback" /tmp/server.log; then
+                            if grep -q "Error" /tmp/server.log || grep -q "Traceback" /tmp/server.log; then
                                 echo "Errors found in server log:"
                                 cat /tmp/server.log
                             else
@@ -93,8 +93,6 @@ pipeline {
                     // Get the port that was actually used
                     env.SERVER_PORT = sh(script: "cat /tmp/server.port || echo '5002'", returnStdout: true).trim()
                     echo "Web application deployed at http://localhost:${env.SERVER_PORT}"
-                    
-                    echo "Web application deployed at http://localhost:5002"
                 }
             }
         }
