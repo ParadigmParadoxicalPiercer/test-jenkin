@@ -41,15 +41,47 @@ pipeline {
                     sh '''
                         cd /tmp/web-app
                         echo "Starting server on port 5002..."
-                        # Use BUILD_ID=dontKillMe to prevent Jenkins from killing the process
-                        BUILD_ID=dontKillMe nohup python3 -m http.server 5002 > /tmp/server.log 2>&1 &
-                        echo $! > /tmp/web-server.pid
-                        sleep 3
+                        
+                        # Try a range of ports in case one is blocked
+                        for PORT in 5002 5003 5004 5005 8080; do
+                            echo "Trying port $PORT..."
+                            
+                            # Check if port is already in use
+                            if lsof -i:$PORT > /dev/null; then
+                                echo "Port $PORT is already in use, trying next port..."
+                                continue
+                            fi
+                            
+                            # Use BUILD_ID=dontKillMe to prevent Jenkins from killing the process
+                            BUILD_ID=dontKillMe nohup python3 -m http.server $PORT > /tmp/server.log 2>&1 &
+                            SERVER_PID=$!
+                            echo $SERVER_PID > /tmp/web-server.pid
+                            echo "Server started with PID $SERVER_PID on port $PORT"
+                            
+                            # Save the port for later use
+                            echo $PORT > /tmp/server.port
+                            
+                            # Wait to ensure server is still running
+                            sleep 3
+                            
+                            # Check if process is still running
+                            if ps -p $SERVER_PID > /dev/null; then
+                                echo "Server process confirmed running on port $PORT"
+                                break
+                            else
+                                echo "Server failed to start on port $PORT"
+                                cat /tmp/server.log
+                            fi
+                        done
+                        
+                        # Confirm server port and status
+                        SERVER_PORT=$(cat /tmp/server.port || echo "5002")
+                        echo "Using port: $SERVER_PORT"
                         
                         # Verify server started correctly
                         if [ -f /tmp/server.log ]; then
                             echo "Server log exists, checking for errors..."
-                            if grep -q "Error" /tmp/server.log; then
+                            if grep -q "Error\|Traceback" /tmp/server.log; then
                                 echo "Errors found in server log:"
                                 cat /tmp/server.log
                             else
@@ -57,6 +89,10 @@ pipeline {
                             fi
                         fi
                     '''
+                    
+                    // Get the port that was actually used
+                    env.SERVER_PORT = sh(script: "cat /tmp/server.port || echo '5002'", returnStdout: true).trim()
+                    echo "Web application deployed at http://localhost:${env.SERVER_PORT}"
                     
                     echo "Web application deployed at http://localhost:5002"
                 }
@@ -70,31 +106,43 @@ pipeline {
                     
                     // Test the deployment with retry logic
                     sh '''
-                        echo "Testing server status..."
+                        # Get the port the server is using
+                        SERVER_PORT=$(cat /tmp/server.port || echo "5002")
+                        echo "Testing server status on port $SERVER_PORT..."
+                        
                         # Check if the process is running
-                        if ! ps aux | grep -q "[p]ython3 -m http.server 5002"; then
-                            echo "ERROR: Server process not found"
-                            # Try to see what happened
-                            echo "--- Server Log ---"
-                            cat /tmp/server.log || echo "No log file found"
-                            echo "--- Process List ---"
-                            ps aux | grep python || echo "No python processes"
+                        if [ -f /tmp/web-server.pid ]; then
+                            PID=$(cat /tmp/web-server.pid)
+                            echo "Server PID: $PID"
+                            if ! ps -p $PID > /dev/null; then
+                                echo "ERROR: Server process $PID not found"
+                                # Try to see what happened
+                                echo "--- Server Log ---"
+                                cat /tmp/server.log || echo "No log file found"
+                                echo "--- Process List ---"
+                                ps aux | grep python || echo "No python processes"
+                                exit 1
+                            else
+                                echo "Server process $PID is running"
+                            fi
+                        else
+                            echo "ERROR: No PID file found"
                             exit 1
                         fi
                         
-                        echo "Server process is running, testing connectivity..."
+                        echo "Server process is running, testing connectivity on port $SERVER_PORT..."
                         
                         # Try multiple times to connect
-                        max_attempts=5
+                        max_attempts=10
                         attempt=1
                         while [ $attempt -le $max_attempts ]; do
                             echo "Connection attempt $attempt of $max_attempts..."
-                            if curl -s -f -m 2 http://localhost:5002/ > /dev/null || curl -s -f -m 2 http://localhost:5002/index.html > /dev/null; then
+                            if curl -s -f -m 5 http://localhost:$SERVER_PORT/ > /dev/null || curl -s -f -m 5 http://localhost:$SERVER_PORT/index.html > /dev/null; then
                                 echo "SUCCESS: Connected to server!"
                                 exit 0
                             else
                                 echo "Connection attempt failed. Waiting to retry..."
-                                sleep 2
+                                sleep 3
                                 attempt=$((attempt+1))
                             fi
                         done
@@ -102,7 +150,9 @@ pipeline {
                         echo "ERROR: Failed to connect after $max_attempts attempts"
                         echo "--- Server Log ---"
                         cat /tmp/server.log || echo "No log file found"
-                        netstat -an | grep 5002 || echo "No process listening on port 5002"
+                        echo "--- Network Status ---"
+                        lsof -i:$SERVER_PORT || echo "No process listening on port $SERVER_PORT"
+                        netstat -an | grep $SERVER_PORT || echo "No netstat entries for port $SERVER_PORT"
                         exit 1
                     '''
                     
@@ -116,25 +166,35 @@ pipeline {
             script {
                 echo "Pipeline completed! Cleaning up resources..."
                 
+                // Get the server port
+                def serverPort = sh(script: "cat /tmp/server.port || echo '5002'", returnStdout: true).trim()
+                
                 // Keep the server running for manual testing if successful
-                if (currentBuild.result == 'SUCCESS') {
-                    echo "Build successful - server is running at http://localhost:5002"
+                if (currentBuild.result == 'SUCCESS' || currentBuild.resultIsBetterOrEqualTo('SUCCESS')) {
+                    echo "Build successful - server is running at http://localhost:${serverPort}"
                 } else {
                     // Clean up if the build failed
                     sh '''
                         echo "Cleaning up processes..."
                         if [ -f /tmp/web-server.pid ]; then
                             echo "Killing web server process..."
-                            kill $(cat /tmp/web-server.pid) || true
+                            PID=$(cat /tmp/web-server.pid)
+                            echo "Killing process $PID"
+                            kill $PID || true
+                            kill -9 $PID || true
                         fi
                         
-                        # Make extra sure we kill any processes
-                        pkill -f "python3 -m http.server 5002" || true
+                        # Get the port that was used
+                        SERVER_PORT=$(cat /tmp/server.port || echo "5002")
+                        echo "Cleaning up port $SERVER_PORT"
                         
-                        # Check for any remaining processes on port 5002
-                        PID=$(lsof -t -i:5002) || true
+                        # Make extra sure we kill any HTTP server processes
+                        pkill -f "python3 -m http.server" || true
+                        
+                        # Check for any remaining processes on the port
+                        PID=$(lsof -t -i:$SERVER_PORT) || true
                         if [ ! -z "$PID" ]; then
-                            echo "Found leftover process $PID on port 5002, killing it..."
+                            echo "Found leftover process $PID on port $SERVER_PORT, killing it..."
                             kill -9 $PID || true
                         fi
                     '''
@@ -143,7 +203,8 @@ pipeline {
         }
         success {
             script {
-                echo "✅ SUCCESS: Web application is available at http://localhost:5002"
+                def serverPort = sh(script: "cat /tmp/server.port || echo '5002'", returnStdout: true).trim()
+                echo "✅ SUCCESS: Web application is available at http://localhost:${serverPort}"
             }
         }
         failure {
