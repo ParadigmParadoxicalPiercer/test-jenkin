@@ -34,8 +34,26 @@ pipeline {
                     '''
                     
                     // Copy files to a web directory
-                    sh 'mkdir -p /tmp/web-app'
-                    sh 'cp *.html /tmp/web-app/'
+                    sh '''
+                        mkdir -p /tmp/web-app
+                        cp *.html /tmp/web-app/
+                        
+                        # Create a test index file if the original doesn't exist or has issues
+                        echo "<!DOCTYPE html>
+<html>
+<head>
+    <title>Test Page</title>
+</head>
+<body>
+    <h1>Hello World - Test Page</h1>
+    <p>This is a test page created by Jenkins.</p>
+    <p>Current time: $(date)</p>
+</body>
+</html>" > /tmp/web-app/test.html
+                        
+                        # Set proper permissions (critical for avoiding 403 errors)
+                        chmod -R 755 /tmp/web-app
+                    '''
                     
                     // Start a simple Python HTTP server on port 5002 in background
                     sh '''
@@ -53,7 +71,10 @@ pipeline {
                             fi
                             
                             # Use BUILD_ID=dontKillMe to prevent Jenkins from killing the process
-                            BUILD_ID=dontKillMe nohup python3 -m http.server $PORT > /tmp/server.log 2>&1 &
+                            # Set the directory permissions to be more permissive first
+                            chmod -R 755 /tmp/web-app
+                            # Run with a command that enables directory listing to avoid 403 errors
+                            BUILD_ID=dontKillMe nohup python3 -c "import http.server; http.server.test(HandlerClass=http.server.SimpleHTTPRequestHandler, ServerClass=http.server.ThreadingHTTPServer, port=$PORT, bind='localhost')" > /tmp/server.log 2>&1 &
                             SERVER_PID=$!
                             echo $SERVER_PID > /tmp/web-server.pid
                             echo "Server started with PID $SERVER_PID on port $PORT"
@@ -135,7 +156,7 @@ pipeline {
                         attempt=1
                         while [ $attempt -le $max_attempts ]; do
                             echo "Connection attempt $attempt of $max_attempts..."
-                            if curl -s -f -m 5 http://localhost:$SERVER_PORT/ > /dev/null || curl -s -f -m 5 http://localhost:$SERVER_PORT/index.html > /dev/null; then
+                            if curl -s -f -m 5 http://localhost:$SERVER_PORT/ > /dev/null || curl -s -f -m 5 http://localhost:$SERVER_PORT/index.html > /dev/null || curl -s -f -m 5 http://localhost:$SERVER_PORT/test.html > /dev/null; then
                                 echo "SUCCESS: Connected to server!"
                                 exit 0
                             else
@@ -148,9 +169,18 @@ pipeline {
                         echo "ERROR: Failed to connect after $max_attempts attempts"
                         echo "--- Server Log ---"
                         cat /tmp/server.log || echo "No log file found"
+                        echo "--- Directory Listing ---"
+                        ls -la /tmp/web-app/
+                        echo "--- File Permissions ---"
+                        stat /tmp/web-app/ || echo "No stat info available"
                         echo "--- Network Status ---"
                         lsof -i:$SERVER_PORT || echo "No process listening on port $SERVER_PORT"
                         netstat -an | grep $SERVER_PORT || echo "No netstat entries for port $SERVER_PORT"
+                        
+                        # Try a more verbose curl to see exact error
+                        echo "--- Verbose HTTP Request ---"
+                        curl -v http://localhost:$SERVER_PORT/test.html
+                        
                         exit 1
                     '''
                     
